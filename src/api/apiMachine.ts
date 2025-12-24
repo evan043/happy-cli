@@ -20,6 +20,7 @@ interface ServerToDaemonEvents {
     'rpc-error': (data: { type: string, error: string }) => void;
     auth: (data: { success: boolean, user: string }) => void;
     error: (data: { message: string }) => void;
+    'message-for-stdin': (data: { sessionId: string, messageId: string, content: string }) => void;
 }
 
 interface DaemonToServerEvents {
@@ -67,11 +68,14 @@ interface DaemonToServerEvents {
         result?: any
         error?: string
     }) => void) => void;
+    'machine:subscribe-session': (data: { sessionId: string }) => void;
+    'message-stdin-ack': (data: { sessionId: string, messageId: string, status: string }) => void;
 }
 
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
     stopSession: (sessionId: string) => boolean;
+    injectToClaudeStdin: (sessionId: string, content: string) => boolean;
     requestShutdown: () => void;
 }
 
@@ -79,6 +83,7 @@ export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
     private keepAliveInterval: NodeJS.Timeout | null = null;
     private rpcHandlerManager: RpcHandlerManager;
+    private stdinInjector: ((sessionId: string, content: string) => boolean) | null = null;
 
     constructor(
         private token: string,
@@ -98,8 +103,11 @@ export class ApiMachineClient {
     setRPCHandlers({
         spawnSession,
         stopSession,
+        injectToClaudeStdin,
         requestShutdown
     }: MachineRpcHandlers) {
+        // Store stdin injector for direct socket listener
+        this.stdinInjector = injectToClaudeStdin;
         // Register spawn session handler
         this.rpcHandlerManager.registerHandler('spawn-happy-session', async (params: any) => {
             const { directory, sessionId, machineId, approvedNewDirectoryCreation, agent, token } = params || {};
@@ -125,7 +133,7 @@ export class ApiMachineClient {
             }
         });
 
-        // Register stop session handler  
+        // Register stop session handler
         this.rpcHandlerManager.registerHandler('stop-session', (params: any) => {
             const { sessionId } = params || {};
 
@@ -140,6 +148,27 @@ export class ApiMachineClient {
 
             logger.debug(`[API MACHINE] Stopped session ${sessionId}`);
             return { message: 'Session stopped' };
+        });
+
+        // Register stdin injection handler
+        this.rpcHandlerManager.registerHandler('inject-stdin', (params: any) => {
+            const { sessionId, content } = params || {};
+
+            if (!sessionId) {
+                throw new Error('Session ID is required');
+            }
+
+            if (!content) {
+                throw new Error('Content is required');
+            }
+
+            const success = injectToClaudeStdin(sessionId, content);
+            if (!success) {
+                throw new Error('Session not found or stdin not available');
+            }
+
+            logger.debug(`[API MACHINE] Injected message to session ${sessionId}`);
+            return { message: 'Message injected successfully' };
         });
 
         // Register stop daemon handler
@@ -264,6 +293,37 @@ export class ApiMachineClient {
             callback(await this.rpcHandlerManager.handleRequest(data));
         });
 
+        // Handle stdin injection messages from Web UI
+        this.socket.on('message-for-stdin', async (data: { sessionId: string, messageId: string, content: string }) => {
+            logger.debug(`[API MACHINE] Received message-for-stdin:`, data);
+
+            if (!this.stdinInjector) {
+                logger.debug('[API MACHINE] No stdin injector registered, cannot process message');
+                this.socket.emit('message-stdin-ack', {
+                    sessionId: data.sessionId,
+                    messageId: data.messageId,
+                    status: 'error-no-injector'
+                });
+                return;
+            }
+
+            try {
+                const success = this.stdinInjector(data.sessionId, data.content);
+                this.socket.emit('message-stdin-ack', {
+                    sessionId: data.sessionId,
+                    messageId: data.messageId,
+                    status: success ? 'injected' : 'error-session-not-found'
+                });
+            } catch (error) {
+                logger.debug('[API MACHINE] Failed to inject stdin:', error);
+                this.socket.emit('message-stdin-ack', {
+                    sessionId: data.sessionId,
+                    messageId: data.messageId,
+                    status: 'error-exception'
+                });
+            }
+        });
+
         // Handle update events from server
         this.socket.on('update', (data: Update) => {
             // Machine clients should only care about machine updates
@@ -316,6 +376,18 @@ export class ApiMachineClient {
             clearInterval(this.keepAliveInterval);
             this.keepAliveInterval = null;
             logger.debug('[API MACHINE] Keep-alive stopped');
+        }
+    }
+
+    /**
+     * Subscribe to a session to receive Web UI messages for stdin injection
+     */
+    subscribeToSession(sessionId: string) {
+        if (this.socket?.connected) {
+            logger.debug(`[API MACHINE] Subscribing to session ${sessionId}`);
+            this.socket.emit('machine:subscribe-session', { sessionId });
+        } else {
+            logger.debug(`[API MACHINE] Cannot subscribe to session ${sessionId} - socket not connected`);
         }
     }
 

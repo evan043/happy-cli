@@ -140,6 +140,9 @@ export async function startDaemon(): Promise<void> {
     // Helper functions
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
 
+    // Session subscription callback - set after apiMachine is created
+    let subscribeToSessionCallback: ((sessionId: string) => void) | null = null;
+
     // Handle webhook from happy session reporting itself
     const onHappySessionWebhook = (sessionId: string, sessionMetadata: Metadata) => {
       logger.debugLargeJson(`[DAEMON RUN] Session reported`, sessionMetadata);
@@ -162,6 +165,11 @@ export async function startDaemon(): Promise<void> {
         existingSession.happySessionMetadataFromLocalWebhook = sessionMetadata;
         logger.debug(`[DAEMON RUN] Updated daemon-spawned session ${sessionId} with metadata`);
 
+        // Subscribe to session for Web UI message routing
+        if (subscribeToSessionCallback) {
+          subscribeToSessionCallback(sessionId);
+        }
+
         // Resolve any awaiter for this PID
         const awaiter = pidToAwaiter.get(pid);
         if (awaiter) {
@@ -179,6 +187,11 @@ export async function startDaemon(): Promise<void> {
         };
         pidToTrackedSession.set(pid, trackedSession);
         logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
+
+        // Subscribe to session for Web UI message routing
+        if (subscribeToSessionCallback) {
+          subscribeToSessionCallback(sessionId);
+        }
       }
     };
 
@@ -286,7 +299,7 @@ export async function startDaemon(): Promise<void> {
         const happyProcess = spawnHappyCLI(args, {
           cwd: directory,
           detached: true,  // Sessions stay alive when daemon stops
-          stdio: ['ignore', 'pipe', 'pipe'],  // Capture stdout/stderr for debugging
+          stdio: ['pipe', 'pipe', 'pipe'],  // Enable stdin for message injection, capture stdout/stderr
           env: {
             ...process.env,
             ...extraEnv
@@ -409,6 +422,33 @@ export async function startDaemon(): Promise<void> {
       return false;
     };
 
+    // Inject message to Claude stdin
+    const injectToClaudeStdin = (sessionId: string, content: string): boolean => {
+      logger.debug(`[DAEMON RUN] Attempting to inject message to session ${sessionId}`);
+
+      // Find session by sessionId
+      for (const [pid, session] of pidToTrackedSession.entries()) {
+        if (session.happySessionId === sessionId) {
+          if (session.startedBy === 'daemon' && session.childProcess?.stdin?.writable) {
+            try {
+              session.childProcess.stdin.write(content + '\n');
+              logger.debug(`[DAEMON RUN] Message injected to session ${sessionId}`);
+              return true;
+            } catch (error) {
+              logger.debug(`[DAEMON RUN] Failed to inject message to session ${sessionId}:`, error);
+              return false;
+            }
+          } else {
+            logger.debug(`[DAEMON RUN] Session ${sessionId} stdin not available (external or not writable)`);
+            return false;
+          }
+        }
+      }
+
+      logger.debug(`[DAEMON RUN] Session ${sessionId} not found for stdin injection`);
+      return false;
+    };
+
     // Handle child process exit
     const onChildExited = (pid: number) => {
       logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
@@ -461,11 +501,24 @@ export async function startDaemon(): Promise<void> {
     apiMachine.setRPCHandlers({
       spawnSession,
       stopSession,
+      injectToClaudeStdin,
       requestShutdown: () => requestShutdown('happy-app')
     });
 
     // Connect to server
     apiMachine.connect();
+
+    // Set up session subscription callback for Web UI message routing
+    subscribeToSessionCallback = (sessionId: string) => {
+      apiMachine.subscribeToSession(sessionId);
+    };
+
+    // Subscribe to any existing sessions
+    for (const session of pidToTrackedSession.values()) {
+      if (session.happySessionId) {
+        apiMachine.subscribeToSession(session.happySessionId);
+      }
+    }
 
     // Every 60 seconds:
     // 1. Prune stale sessions
